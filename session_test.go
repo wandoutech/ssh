@@ -19,11 +19,11 @@ func (srv *Server) serveOnce(l net.Listener) error {
 	if e != nil {
 		return e
 	}
-	srv.channelHandlers = map[string]channelHandler{
-		"session":      sessionHandler,
-		"direct-tcpip": directTcpipHandler,
+	srv.ChannelHandlers = map[string]ChannelHandler{
+		"session":      DefaultSessionHandler,
+		"direct-tcpip": DirectTCPIPHandler,
 	}
-	srv.handleConn(conn)
+	srv.HandleConn(conn)
 	return nil
 }
 
@@ -289,20 +289,40 @@ func TestPtyResize(t *testing.T) {
 func TestSignals(t *testing.T) {
 	t.Parallel()
 
+	// errChan lets us get errors back from the session
+	errChan := make(chan error, 5)
+
+	// doneChan lets us specify that we should exit.
+	doneChan := make(chan interface{})
+
 	session, _, cleanup := newTestSession(t, &Server{
 		Handler: func(s Session) {
-			signals := make(chan Signal)
+			// We need to use a buffered channel here, otherwise it's possible for the
+			// second call to Signal to get discarded.
+			signals := make(chan Signal, 2)
 			s.Signals(signals)
-			if sig := <-signals; sig != SIGINT {
-				t.Fatalf("expected signal %v but got %v", SIGINT, sig)
-			}
-			exiter := make(chan bool)
-			go func() {
-				if sig := <-signals; sig == SIGKILL {
-					close(exiter)
+
+			select {
+			case sig := <-signals:
+				if sig != SIGINT {
+					errChan <- fmt.Errorf("expected signal %v but got %v", SIGINT, sig)
+					return
 				}
-			}()
-			<-exiter
+			case <-doneChan:
+				errChan <- fmt.Errorf("Unexpected done")
+				return
+			}
+
+			select {
+			case sig := <-signals:
+				if sig != SIGKILL {
+					errChan <- fmt.Errorf("expected signal %v but got %v", SIGKILL, sig)
+					return
+				}
+			case <-doneChan:
+				errChan <- fmt.Errorf("Unexpected done")
+				return
+			}
 		},
 	}, nil)
 	defer cleanup()
@@ -312,7 +332,106 @@ func TestSignals(t *testing.T) {
 		session.Signal(gossh.SIGKILL)
 	}()
 
-	err := session.Run("")
+	go func() {
+		errChan <- session.Run("")
+	}()
+
+	err := <-errChan
+	close(doneChan)
+
+	if err != nil {
+		t.Fatalf("expected nil but got %v", err)
+	}
+}
+
+func TestBreakWithChanRegistered(t *testing.T) {
+	t.Parallel()
+
+	// errChan lets us get errors back from the session
+	errChan := make(chan error, 5)
+
+	// doneChan lets us specify that we should exit.
+	doneChan := make(chan interface{})
+
+	breakChan := make(chan bool)
+
+	readyToReceiveBreak := make(chan bool)
+
+	session, _, cleanup := newTestSession(t, &Server{
+		Handler: func(s Session) {
+			s.Break(breakChan) // register a break channel with the session
+			readyToReceiveBreak <- true
+
+			select {
+			case <-breakChan:
+				io.WriteString(s, "break")
+			case <-doneChan:
+				errChan <- fmt.Errorf("Unexpected done")
+				return
+			}
+		},
+	}, nil)
+	defer cleanup()
+	var stdout bytes.Buffer
+	session.Stdout = &stdout
+	go func() {
+		errChan <- session.Run("")
+	}()
+
+	<-readyToReceiveBreak
+	ok, err := session.SendRequest("break", true, nil)
+	if err != nil {
+		t.Fatalf("expected nil but got %v", err)
+	}
+	if ok != true {
+		t.Fatalf("expected true but got %v", ok)
+	}
+
+	err = <-errChan
+	close(doneChan)
+
+	if err != nil {
+		t.Fatalf("expected nil but got %v", err)
+	}
+	if !bytes.Equal(stdout.Bytes(), []byte("break")) {
+		t.Fatalf("stdout = %#v, expected 'break'", stdout.Bytes())
+	}
+}
+
+func TestBreakWithoutChanRegistered(t *testing.T) {
+	t.Parallel()
+
+	// errChan lets us get errors back from the session
+	errChan := make(chan error, 5)
+
+	// doneChan lets us specify that we should exit.
+	doneChan := make(chan interface{})
+
+	waitUntilAfterBreakSent := make(chan bool)
+
+	session, _, cleanup := newTestSession(t, &Server{
+		Handler: func(s Session) {
+			<-waitUntilAfterBreakSent
+		},
+	}, nil)
+	defer cleanup()
+	var stdout bytes.Buffer
+	session.Stdout = &stdout
+	go func() {
+		errChan <- session.Run("")
+	}()
+
+	ok, err := session.SendRequest("break", true, nil)
+	if err != nil {
+		t.Fatalf("expected nil but got %v", err)
+	}
+	if ok != false {
+		t.Fatalf("expected false but got %v", ok)
+	}
+	waitUntilAfterBreakSent <- true
+
+	err = <-errChan
+	close(doneChan)
 	if err != nil {
 		t.Fatalf("expected nil but got %v", err)
 	}
